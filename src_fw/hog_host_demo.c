@@ -59,6 +59,7 @@
 #include "bt_example_common.h"
 #include "pico/cyw43_arch.h"
 #include "Common.h"
+#include "bridge_control.h"
 
 //--------------------------------------------------------------------+
 // CONSTANTS & TYPES
@@ -66,6 +67,7 @@
 // Timeout constants
 #define CONNECTION_TIMEOUT_MS 3000  // 3 seconds for connection attempt
 #define SCAN_TIMEOUT_MS       5000  // 5 seconds for scanning
+#define CONTROL_POLL_MS       50
 
 // Connection parameters requested once the link is encrypted. Peripherals are
 // free to advertise a slow, power-saving interval; for an input device the
@@ -91,6 +93,7 @@ static enum {
     W4_ENCRYPTED,
     W4_HID_CLIENT_CONNECTED,
     READY,
+    W4_FORGETTING,
     W4_TIMEOUT_THEN_SCAN,
     W4_TIMEOUT_THEN_RECONNECT,
 } app_state;
@@ -99,7 +102,7 @@ static enum {
 // GLOBAL & STATIC VARIABLES
 //--------------------------------------------------------------------+
 static le_device_addr_t remote_device;
-static hci_con_handle_t connection_handle;
+static hci_con_handle_t connection_handle = HCI_CON_HANDLE_INVALID;
 static uint16_t hids_cid;
 static hid_protocol_mode_t protocol_mode = HID_PROTOCOL_MODE_REPORT;
 
@@ -108,9 +111,15 @@ static hid_protocol_mode_t protocol_mode = HID_PROTOCOL_MODE_REPORT;
 // switching or vendor collections run well past the 500 bytes the BTstack
 // example assumes, and the surplus is silently dropped, so give it 2 KB.
 static uint8_t hid_descriptor_storage[2048];
+// BTstack releases its descriptor on disconnect. USB keeps the first descriptor
+// acquired after boot so BLE reconnects do not change the enumerated device.
+static uint8_t usb_hid_report_descriptor[sizeof(hid_descriptor_storage)];
+static volatile uint16_t usb_hid_report_descriptor_len;
 
 // Used to implement connection timeout and reconnect timer
 static btstack_timer_source_t connection_timer;
+static btstack_timer_source_t control_timer;
+static bool replacing_keyboard;
 
 // Register for events from HCI/GAP and SM
 static btstack_packet_callback_registration_t hci_event_callback_registration;
@@ -142,6 +151,10 @@ static void hog_scan_timeout(btstack_timer_source_t * ts);
 static void hog_connection_timeout(btstack_timer_source_t * ts);
 static void handle_outgoing_connection_error(void);
 static void request_hid_connection_parameters(void);
+static void activate_usb_hid_descriptor(void);
+static void control_timer_handler(btstack_timer_source_t *ts);
+static void start_keyboard_replacement(void);
+static void finish_keyboard_replacement(void);
 static bool adv_event_contains_hid_service(const uint8_t * packet);
 
 static void hid_handle_input_report(uint8_t service_index, uint8_t report_id, const uint8_t * report, uint16_t report_len);
@@ -179,7 +192,11 @@ bool is_ble_app_state_ready(void)
  */
 const uint8_t* get_ble_hid_report_descriptor_data(void)
 {
-    return hids_client_descriptor_storage_get_descriptor_data(hids_cid, 0);
+    if (usb_hid_report_descriptor_len == 0) {
+        return NULL;
+    }
+
+    return usb_hid_report_descriptor;
 }
 
 /**
@@ -188,7 +205,7 @@ const uint8_t* get_ble_hid_report_descriptor_data(void)
  */
 uint16_t get_ble_hid_report_descriptor_len(void)
 {
-    return hids_client_descriptor_storage_get_descriptor_len(hids_cid, 0);
+    return usb_hid_report_descriptor_len;
 }
 
 //--------------------------------------------------------------------+
@@ -232,9 +249,14 @@ int btstack_main(int argc, const char * argv[])
     setvbuf(stdin, NULL, _IONBF, 0);
 
     app_state = W4_WORKING;
+    bridge_control_publish_state(BRIDGE_STATE_STARTING);
 
     // Turn on the device
     hci_power_control(HCI_POWER_ON);
+
+    btstack_run_loop_set_timer_handler(&control_timer, control_timer_handler);
+    btstack_run_loop_set_timer(&control_timer, CONTROL_POLL_MS);
+    btstack_run_loop_add_timer(&control_timer);
     return 0;
 }
 
@@ -283,11 +305,17 @@ static void packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packe
                 case HCI_EVENT_DISCONNECTION_COMPLETE:
                     connection_handle = HCI_CON_HANDLE_INVALID;
                     BLE_LOG("Disconnected, starting over...\n");
+                    bridge_control_clear_passkey();
                     
                     // Fix: Ensure timer is cleared upon disconnection before starting over
                     btstack_run_loop_remove_timer(&connection_timer);
 
-                    // Wait a moment before restarting the loop
+                    if (replacing_keyboard) {
+                        finish_keyboard_replacement();
+                        break;
+                    }
+
+                    bridge_control_publish_state(BRIDGE_STATE_DISCONNECTED);
                     app_state = W4_WORKING;
                     hog_start_connect();
                     break;
@@ -299,6 +327,7 @@ static void packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packe
                     connection_handle = gap_subevent_le_connection_complete_get_connection_handle(packet);
                     // request security
                     app_state = W4_ENCRYPTED;
+                    bridge_control_publish_state(BRIDGE_STATE_PAIRING);
                     sm_request_pairing(connection_handle);
                     break;
                 default:
@@ -335,9 +364,12 @@ static void sm_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *pa
             BLE_LOG("Confirming numeric comparison: %"PRIu32"\n", sm_event_numeric_comparison_request_get_passkey(packet));
             sm_numeric_comparison_confirm(sm_event_passkey_display_number_get_handle(packet));
             break;
-        case SM_EVENT_PASSKEY_DISPLAY_NUMBER:
-            BLE_LOG("Display Passkey: %"PRIu32"\n", sm_event_passkey_display_number_get_passkey(packet));
+        case SM_EVENT_PASSKEY_DISPLAY_NUMBER: {
+            uint32_t passkey = sm_event_passkey_display_number_get_passkey(packet);
+            bridge_control_publish_passkey(passkey);
+            BLE_LOG("Display Passkey: %"PRIu32"\n", passkey);
             break;
+        }
         case SM_EVENT_PAIRING_COMPLETE:
             switch (sm_event_pairing_complete_get_status(packet)){
                 case ERROR_CODE_SUCCESS:
@@ -368,6 +400,7 @@ static void sm_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *pa
         // continue - query primary services
         BLE_LOG("Search for HID service.\n");
         app_state = W4_HID_CLIENT_CONNECTED;
+        bridge_control_publish_state(BRIDGE_STATE_DISCOVERING);
         hids_client_connect(connection_handle, handle_gatt_client_event, protocol_mode, &hids_cid);
     }
 }
@@ -406,9 +439,9 @@ static void handle_gatt_client_event(uint8_t packet_type, uint16_t channel, uint
                     // done
                     BLE_LOG("Ready - please start typing or mousing..\n");
                     app_state = READY;
-                    // Re-initialize the USB device to make the USB host re-acquire the descriptor.
-                    // This flag is referenced by USB task.
-                    g_usb_reinit_request = true;
+                    bridge_control_clear_passkey();
+                    bridge_control_publish_state(BRIDGE_STATE_READY);
+                    activate_usb_hid_descriptor();
                     break;
                 default:
                     BLE_LOG("HID service client connection failed, status 0x%02x.\n", status);
@@ -463,6 +496,8 @@ static void hog_start_connect(void)
 static void hog_connect(void)
 {
     BLE_LOG("Connecting to device %s (Timeout %dms)...\n", bd_addr_to_str(remote_device.addr), CONNECTION_TIMEOUT_MS);
+    bridge_control_clear_passkey();
+    bridge_control_publish_state(BRIDGE_STATE_CONNECTING);
     
     // Fix: Remove timer before adding. If a previous timer (like scan timeout) is still active, 
     // btstack_run_loop_add_timer would trigger an assertion failure.
@@ -484,6 +519,8 @@ static void hog_start_scan(void)
 {
     BLE_LOG("Scanning for LE HID devices (Timeout %dms)...\n", SCAN_TIMEOUT_MS);
     app_state = W4_HID_DEVICE_FOUND;
+    bridge_control_clear_passkey();
+    bridge_control_publish_state(BRIDGE_STATE_SCANNING);
 
     // Fix: Remove timer before adding to prevent assertion if scan is restarted during reconnection
     btstack_run_loop_remove_timer(&connection_timer);
@@ -547,6 +584,90 @@ static void request_hid_connection_parameters(void)
 }
 
 /**
+ * @brief Copy the connected BLE HID device's report descriptor into the USB-facing
+ *        buffer and request USB re-enumeration if it differs from the active one.
+ */
+static void activate_usb_hid_descriptor(void)
+{
+    const uint8_t * descriptor = hids_client_descriptor_storage_get_descriptor_data(hids_cid, 0);
+    uint16_t descriptor_len = hids_client_descriptor_storage_get_descriptor_len(hids_cid, 0);
+    if (descriptor == NULL || descriptor_len == 0 ||
+        descriptor_len > sizeof(usb_hid_report_descriptor)) {
+        return;
+    }
+
+    if (usb_hid_report_descriptor_len == descriptor_len &&
+        memcmp(usb_hid_report_descriptor, descriptor, descriptor_len) == 0) {
+        return;
+    }
+
+    memcpy(usb_hid_report_descriptor, descriptor, descriptor_len);
+    usb_hid_report_descriptor_len = descriptor_len;
+    g_usb_reinit_request = true;
+}
+
+/**
+ * @brief Periodic timer callback that polls for a pending "pair new keyboard"
+ *        request from the Web Serial control UI and reschedules itself.
+ */
+static void control_timer_handler(btstack_timer_source_t *ts)
+{
+    UNUSED(ts);
+    if (app_state != W4_WORKING && bridge_control_take_pair_new_request()) {
+        start_keyboard_replacement();
+    }
+
+    btstack_run_loop_set_timer(&control_timer, CONTROL_POLL_MS);
+    btstack_run_loop_add_timer(&control_timer);
+}
+
+/**
+ * @brief Begin forgetting the currently paired keyboard so a new one can be
+ *        scanned for and paired. Disconnects first if a link is active;
+ *        otherwise finishes the replacement immediately.
+ */
+static void start_keyboard_replacement(void)
+{
+    if (replacing_keyboard) {
+        return;
+    }
+
+    replacing_keyboard = true;
+    app_state = W4_FORGETTING;
+    bridge_control_clear_passkey();
+    bridge_control_publish_state(BRIDGE_STATE_FORGETTING);
+    btstack_run_loop_remove_timer(&connection_timer);
+    gap_stop_scan();
+
+    if (connection_handle != HCI_CON_HANDLE_INVALID) {
+        gap_disconnect(connection_handle);
+        return;
+    }
+
+    gap_connect_cancel();
+    finish_keyboard_replacement();
+}
+
+/**
+ * @brief Erase the stored HOGD bonding data and remembered device address,
+ *        then restart scanning for a new BLE HID keyboard to pair with.
+ */
+static void finish_keyboard_replacement(void)
+{
+    if (btstack_tlv_singleton_impl != NULL) {
+        btstack_tlv_singleton_impl->delete_tag(btstack_tlv_singleton_context, TLV_TAG_HOGD);
+    }
+
+    gap_delete_bonding(remote_device.addr_type, remote_device.addr);
+
+    memset(&remote_device, 0, sizeof(remote_device));
+    connection_handle = HCI_CON_HANDLE_INVALID;
+    replacing_keyboard = false;
+    CMN_ClearQueue(CMN_QUE_KIND_HID_RPT);
+    hog_start_scan();
+}
+
+/**
  * @brief Check if advertising event packet contains HID service UUID.
  * @param packet Pointer to advertising report packet.
  * @return true if HID service UUID is found, false otherwise.
@@ -571,12 +692,14 @@ static bool adv_event_contains_hid_service(const uint8_t * packet)
  */
 static void hid_handle_input_report(uint8_t service_index, uint8_t report_id, const uint8_t * report, uint16_t report_len)
 {
-    // If an input report is received while not yet in READY state (e.g. fast reconnect),
-    // update app_state to READY and request USB re-init so LED state becomes READY.
+    // A report can arrive before the connection event during a fast reconnect.
+    // Keep report handling live without re-enumerating an already active USB device.
     if (app_state != READY) {
         BLE_LOG("HID report received in state %d. Forcing app_state to READY.\n", app_state);
         app_state = READY;
-        g_usb_reinit_request = true;
+        bridge_control_clear_passkey();
+        bridge_control_publish_state(BRIDGE_STATE_READY);
+        activate_usb_hid_descriptor();
     }
     
     // Enqueue the raw report for the USB task.

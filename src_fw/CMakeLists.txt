@@ -40,6 +40,23 @@ project(picow_ble_usb_hid_bridge C CXX ASM)
 
 # Initialise the Raspberry Pi Pico SDK
 pico_sdk_init()
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+
+set(MSC_DISK_IMAGE_HEADER ${CMAKE_CURRENT_BINARY_DIR}/generated/msc_disk_image.h)
+add_custom_command(
+    OUTPUT ${MSC_DISK_IMAGE_HEADER}
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/../tools/generate_msc_image.py
+            --html ${CMAKE_CURRENT_SOURCE_DIR}/web_ui/index.htm
+            --readme ${CMAKE_CURRENT_SOURCE_DIR}/web_ui/README.TXT
+            --output ${MSC_DISK_IMAGE_HEADER}
+    DEPENDS
+        ${CMAKE_CURRENT_SOURCE_DIR}/web_ui/index.htm
+        ${CMAKE_CURRENT_SOURCE_DIR}/web_ui/README.TXT
+        ${CMAKE_CURRENT_SOURCE_DIR}/../tools/generate_msc_image.py
+    VERBATIM
+)
+add_custom_target(generate_msc_disk_image DEPENDS ${MSC_DISK_IMAGE_HEADER})
 
 add_compile_options(-Wall
         -Wno-format          # int != int32_t as far as the compiler is concerned because gcc has int32_t as long int
@@ -50,11 +67,14 @@ add_compile_options(-Wall
 # Add executable.  
 add_executable(picow_ble_usb_hid_bridge
     main.c
+    bridge_control.c
+    msc_disk.c
     usb_descriptors.c
     hog_host_demo.c
     bt_example_common.c
     Common.c
     )  
+add_dependencies(picow_ble_usb_hid_bridge generate_msc_disk_image)
 target_link_libraries(picow_ble_usb_hid_bridge
     pico_stdlib
     pico_multicore
@@ -70,6 +90,7 @@ target_link_libraries(picow_ble_usb_hid_bridge
     )   
 target_include_directories(picow_ble_usb_hid_bridge PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_BINARY_DIR}/generated
     )
 target_compile_definitions(picow_ble_usb_hid_bridge PRIVATE 
     CYW43_LWIP=0

@@ -1,5 +1,14 @@
 # Changelog
 
+## 20260912
+
+- Added a read-only `PICO-PAIR` USB disk with an offline browser pairing UI.
+- Added a Web Serial control protocol for connection status and pairing codes.
+- Added confirmed replacement pairing that forgets the current keyboard and
+  scans for a new BLE HID device.
+- USB re-enumeration now occurs only when the replacement keyboard's HID report
+  descriptor differs from the active descriptor.
+
 ## 20260813
 
 - Changes in `hog_host_demo.c`

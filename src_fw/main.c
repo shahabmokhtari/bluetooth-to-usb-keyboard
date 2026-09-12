@@ -26,6 +26,7 @@
 #include "bsp/board_api.h"
 #include "tusb.h"
 #include "Common.h"
+#include "bridge_control.h"
 
 //--------------------------------------------------------------------+
 // MACROS
@@ -65,6 +66,7 @@ int main(void)
     
     stdio_init_all();
     CMN_Init();
+    bridge_control_init();
 
     SYS_LOG("BLE to USB HID bridge starting\n");
 
@@ -113,6 +115,7 @@ void usb_dev_main(void)
         }
 
         tud_task();          // Run TinyUSB device task
+        bridge_control_task();
         led_blinking_task(); // Run LED blinking task
         hid_task();          // Run HID report sending task
     }

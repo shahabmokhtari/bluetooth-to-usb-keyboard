@@ -40,7 +40,6 @@
 #define USB_VID     0xCafe
 #define USB_BCD     0x0200
 
-extern bool is_ble_app_state_ready(void);
 extern const uint8_t* get_ble_hid_report_descriptor_data(void);
 extern uint16_t get_ble_hid_report_descriptor_len(void);
 
@@ -52,9 +51,9 @@ tusb_desc_device_t const desc_device =
     .bLength                = sizeof(tusb_desc_device_t),
     .bDescriptorType        = TUSB_DESC_DEVICE,
     .bcdUSB                 = USB_BCD,
-    .bDeviceClass           = 0x00,
-    .bDeviceSubClass        = 0x00,
-    .bDeviceProtocol        = 0x00,
+    .bDeviceClass           = TUSB_CLASS_MISC,
+    .bDeviceSubClass        = MISC_SUBCLASS_COMMON,
+    .bDeviceProtocol        = MISC_PROTOCOL_IAD,
     .bMaxPacketSize0        = CFG_TUD_ENDPOINT0_SIZE,
 
     .idVendor               = USB_VID,
@@ -93,13 +92,13 @@ uint8_t const desc_hid_report[] =
 uint8_t const * tud_hid_descriptor_report_cb(uint8_t instance)
 {
     (void) instance;
-    // When connected via BLE, return the Report Descriptor from the BLE device
-    if (is_ble_app_state_ready() && get_ble_hid_report_descriptor_data() != NULL) {
-        return get_ble_hid_report_descriptor_data();
-    } else {
-        // When not connected, return the default descriptor
-        return desc_hid_report;
+
+    const uint8_t * report_descriptor = get_ble_hid_report_descriptor_data();
+    if (report_descriptor != NULL) {
+        return report_descriptor;
     }   
+
+    return desc_hid_report;
 }
 
 //--------------------------------------------------------------------+
@@ -108,25 +107,32 @@ uint8_t const * tud_hid_descriptor_report_cb(uint8_t instance)
 
 enum
 {
+    ITF_NUM_CDC,
+    ITF_NUM_CDC_DATA,
+    ITF_NUM_MSC,
     ITF_NUM_HID,
     ITF_NUM_TOTAL
 };
 
-#define     CONFIG_TOTAL_LEN    (TUD_CONFIG_DESC_LEN + TUD_HID_DESC_LEN)
+#define EPNUM_CDC_NOTIF  0x81
+#define EPNUM_CDC_OUT    0x02
+#define EPNUM_CDC_IN     0x82
+#define EPNUM_MSC_OUT    0x03
+#define EPNUM_MSC_IN     0x83
+#define EPNUM_HID        0x84
 
-#define EPNUM_HID   0x81
-
-#if 0
-uint8_t const desc_configuration[] =
-{
-    // Config number, interface count, string index, total length, attribute, power in mA
-    TUD_CONFIG_DESCRIPTOR(1, ITF_NUM_TOTAL, 0, CONFIG_TOTAL_LEN, TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 100),
-
-    // Interface number, string index, protocol, report descriptor len, EP In address, size & polling interval
-    TUD_HID_DESCRIPTOR(ITF_NUM_HID, 0, HID_ITF_PROTOCOL_NONE, sizeof(desc_hid_report), EPNUM_HID, CFG_TUD_HID_EP_BUFSIZE, 5)
+static uint8_t const desc_cdc[] = {
+    TUD_CDC_DESCRIPTOR(ITF_NUM_CDC, 0, EPNUM_CDC_NOTIF, 8,
+                       EPNUM_CDC_OUT, EPNUM_CDC_IN, CFG_TUD_CDC_EP_BUFSIZE)
 };
-#endif
-#define DYNAMIC_CONFIG_BUF_SIZE (TUD_CONFIG_DESC_LEN + TUD_HID_DESC_LEN)
+
+static uint8_t const desc_msc[] = {
+    TUD_MSC_DESCRIPTOR(ITF_NUM_MSC, 0, EPNUM_MSC_OUT, EPNUM_MSC_IN,
+                       CFG_TUD_MSC_EP_BUFSIZE)
+};
+
+#define DYNAMIC_CONFIG_BUF_SIZE \
+    (TUD_CONFIG_DESC_LEN + TUD_CDC_DESC_LEN + TUD_MSC_DESC_LEN + TUD_HID_DESC_LEN)
 // Align the buffer to 4 bytes to ensure efficient and safe access
 static uint8_t desc_configuration[DYNAMIC_CONFIG_BUF_SIZE] __attribute__((aligned(4)));
 
@@ -143,11 +149,8 @@ uint8_t const * tud_descriptor_configuration_cb(uint8_t index)
     uint8_t *p_desc = desc_configuration;
     uint8_t const * const desc_end = p_desc + DYNAMIC_CONFIG_BUF_SIZE;
 
-    // Determine which report descriptor to use
-    uint16_t report_desc_len;
-    if (is_ble_app_state_ready() && get_ble_hid_report_descriptor_len() > 0) {
-        report_desc_len = get_ble_hid_report_descriptor_len();
-    } else {
+    uint16_t report_desc_len = get_ble_hid_report_descriptor_len();
+    if (report_desc_len == 0) {
         report_desc_len = sizeof(desc_hid_report);
     }
 
@@ -165,7 +168,15 @@ uint8_t const * tud_descriptor_configuration_cb(uint8_t index)
     config_desc->bMaxPower = 250;
     p_desc += sizeof(tusb_desc_configuration_t);
 
-    // 2. Build HID Interface Descriptor
+    // 2. Add the USB serial interface used to display pairing codes.
+    memcpy(p_desc, desc_cdc, sizeof(desc_cdc));
+    p_desc += sizeof(desc_cdc);
+
+    // 3. Add the read-only pairing UI disk.
+    memcpy(p_desc, desc_msc, sizeof(desc_msc));
+    p_desc += sizeof(desc_msc);
+
+    // 4. Build HID Interface Descriptor
     tusb_desc_interface_t *if_desc = (tusb_desc_interface_t*) p_desc;
     if_desc->bLength = sizeof(tusb_desc_interface_t);
     if_desc->bDescriptorType = TUSB_DESC_INTERFACE;
@@ -178,7 +189,7 @@ uint8_t const * tud_descriptor_configuration_cb(uint8_t index)
     if_desc->iInterface = 0;
     p_desc += sizeof(tusb_desc_interface_t);
 
-    // 3. Build HID Descriptor
+    // 5. Build HID Descriptor
     // Use tu_unaligned_write16() for fields that might not be aligned.
     *p_desc++ = 9; // bLength
     *p_desc++ = HID_DESC_TYPE_HID; // bDescriptorType
@@ -188,7 +199,7 @@ uint8_t const * tud_descriptor_configuration_cb(uint8_t index)
     *p_desc++ = HID_DESC_TYPE_REPORT; // bDescriptorType
     tu_unaligned_write16(p_desc, report_desc_len); p_desc += 2; // wDescriptorLength
     
-    // 4. Build Endpoint Descriptor
+    // 6. Build Endpoint Descriptor
     tusb_desc_endpoint_t *ep_desc = (tusb_desc_endpoint_t*) p_desc;
     // Set wTotalLength
     // Use tu_htole16 for portability (though RP2040 is little-endian)

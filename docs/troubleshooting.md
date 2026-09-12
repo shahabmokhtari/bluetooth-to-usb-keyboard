@@ -10,6 +10,15 @@
 
 ## Reading the logs
 
+Pairing codes are shown by `INDEX.HTM` on the read-only `PICO-PAIR` USB drive.
+Open it in Google Chrome or Microsoft Edge, click **Connect to Pico**, then
+select `BLE to USB HID Bridge`. Firefox and Safari do not support Web Serial.
+
+The same status is available as newline-delimited JSON over the
+`BLE to USB HID Bridge` serial port at 115200 baud. Send `STATUS` to request
+the current state. Send `PAIR_NEW` to forget the active keyboard and scan for
+a replacement.
+
 Logs go to UART0 — GPIO 0 (TX, physical pin 1) and GPIO 1 (RX, pin 2) — so you
 need a USB-to-serial adapter, with its ground tied to a ground pin on the board.
 The firmware only prints, so wiring the adapter's RX to GPIO 0 and the grounds
@@ -55,6 +64,7 @@ and `led_blinking_task()` does nothing until it sees that flag.
 
 ## The keyboard re-appears on the PC when the BLE link comes up
 
-Expected. Once the bridge has the HID report descriptor of the BLE device, it
-disconnects and reconnects itself so the PC re-reads that descriptor and sees
-the real keyboard rather than the placeholder one.
+Expected after initial pairing, or after replacing the keyboard with one that
+uses a different HID report descriptor. The bridge disconnects and reconnects
+USB once so the PC reads the new descriptor. Normal BLE reconnects do not
+restart or re-enumerate USB.
